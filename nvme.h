@@ -367,7 +367,8 @@ struct nvme_rw_command {
 	__le64 slba;
 	__le16 length;
 	__le16 control;
-	__le32 dsmgmt;
+	__le16 dsmgmt;
+	__le16 dspec;
 	__le32 reftag;
 	__le16 apptag;
 	__le16 appmask;
