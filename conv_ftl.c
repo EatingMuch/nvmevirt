@@ -33,17 +33,10 @@ static bool should_gc(struct conv_ftl *conv_ftl)
 	return (total_free_line_cnt <= conv_ftl->cp.gc_thres_lines);
 }
 
-static inline bool should_gc_high(struct conv_ftl *conv_ftl)
+static inline bool should_gc_high(struct conv_ftl *conv_ftl, uint32_t stream_id)
 {
-	int i;
-
-	for (i = 0; i < get_nr_streams(conv_ftl); i++) {
-		if (conv_ftl->lm[i].free_line_cnt <=
-		    conv_ftl->cp.gc_thres_lines_high)
-			return true;
-	}
-
-	return false;
+	return (conv_ftl->lm[stream_id].free_line_cnt <=
+		conv_ftl->cp.gc_thres_lines_high);
 }
 
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
@@ -113,18 +106,20 @@ static inline void victim_line_set_pos(void *a, size_t pos)
 	((struct line *)a)->pos = pos;
 }
 
-static inline void consume_write_credit(struct conv_ftl *conv_ftl)
+static inline void consume_write_credit(struct conv_ftl *conv_ftl,
+					uint32_t stream_id)
 {
-	conv_ftl->wfc.write_credits--;
+	conv_ftl->wfc[stream_id].write_credits--;
 }
 
-static void foreground_gc(struct conv_ftl *conv_ftl);
+static void foreground_gc(struct conv_ftl *conv_ftl, uint32_t stream_id);
 
-static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
+static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl,
+						 uint32_t stream_id)
 {
-	struct write_flow_control *wfc = &(conv_ftl->wfc);
+	struct write_flow_control *wfc = &(conv_ftl->wfc[stream_id]);
 	if (wfc->write_credits <= 0) {
-		foreground_gc(conv_ftl);
+		foreground_gc(conv_ftl, stream_id);
 
 		wfc->write_credits += wfc->credits_to_refill;
 	}
@@ -141,11 +136,20 @@ static void init_write_pointers(struct conv_ftl *conv_ftl)
 			    __func__);
 		return;
 	}
+
+	conv_ftl->gc_wp = kmalloc(sizeof(struct write_pointer) * nr_streams,
+			       GFP_KERNEL);
+	if (!conv_ftl->gc_wp) {
+		NVMEV_ERROR("%s: Failed to allocate memory for gc write_pointer\n",
+			    __func__);
+		return;
+	}
 }
 
 static void remove_write_pointers(struct conv_ftl *conv_ftl)
 {
 	kfree(conv_ftl->wp);
+	kfree(conv_ftl->gc_wp);
 }
 
 static void init_lines(struct conv_ftl *conv_ftl)
@@ -210,11 +214,29 @@ static void remove_lines(struct conv_ftl *conv_ftl)
 
 static void init_write_flow_control(struct conv_ftl *conv_ftl)
 {
-	struct write_flow_control *wfc = &(conv_ftl->wfc);
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+	struct write_flow_control *wfc;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
+	int i;
 
-	wfc->write_credits = spp->pgs_per_line;
-	wfc->credits_to_refill = spp->pgs_per_line;
+	conv_ftl->wfc = kmalloc(sizeof(struct write_flow_control) * nr_streams, GFP_KERNEL);
+
+	for (i = 0; i < nr_streams; i++) {
+		if (!conv_ftl->wfc) {
+			NVMEV_ERROR("%s: Failed to allocate memory for write_flow_control\n", __func__);
+			return;
+		}
+		wfc = &(conv_ftl->wfc[i]);
+		wfc->write_credits = spp->pgs_per_line;
+		wfc->credits_to_refill = spp->pgs_per_line;
+	}
+}
+
+static void remove_write_flow_controls(struct conv_ftl *conv_ftl)
+{
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+
+	kfree(conv_ftl->wfc);
 }
 
 static inline void check_addr(int a, int max)
@@ -246,7 +268,7 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type,
 		return &ftl->wp[stream_id];
 	} else if (io_type == GC_IO) {
 		/* TODO: gc may need to be stream-aware */
-		return &ftl->gc_wp;
+		return &ftl->gc_wp[stream_id];
 	}
 
 	NVMEV_ASSERT(0);
@@ -423,7 +445,6 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 	/*
 	 * initialize write pointers
-	 * TODO: gc_wp needs initialization for adopting multi-stream
 	 */
 	init_write_pointers(conv_ftl);
 
@@ -441,6 +462,7 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 
 static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 {
+	remove_write_flow_controls(conv_ftl);
 	remove_lines(conv_ftl);
 	remove_rmap(conv_ftl);
 	remove_maptbl(conv_ftl);
@@ -688,7 +710,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-	new_ppa = get_new_page(conv_ftl, GC_IO, 0);
+	new_ppa = get_new_page(conv_ftl, GC_IO, get_stream_id(old_ppa));
 	/* update maptbl */
 	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
@@ -697,7 +719,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	mark_page_valid(conv_ftl, &new_ppa);
 
 	/* need to advance the write pointer here */
-	advance_write_pointer(conv_ftl, GC_IO, 0);
+	advance_write_pointer(conv_ftl, GC_IO, get_stream_id(old_ppa));
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -744,9 +766,8 @@ static uint32_t find_lm(struct conv_ftl *conv_ftl)
 	return max_index;
 }
 
-static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
+static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force, uint32_t stream_id)
 {
-	uint32_t stream_id = find_lm(conv_ftl);
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
 	struct line *victim_line = NULL;
@@ -854,58 +875,56 @@ static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 	lm->free_line_cnt++;
 }
 
-static int do_gc(struct conv_ftl *conv_ftl, bool force)
+static int do_gc(struct conv_ftl *conv_ftl, bool force, uint32_t stream_id)
 {
 	struct line *victim_line = NULL;
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
 	struct ppa ppa;
 	int flashpg;
 
-	victim_line = select_victim_line(conv_ftl, force);
+	victim_line = select_victim_line(conv_ftl, force, stream_id);
 	if (!victim_line) {
 		return -1;
 	}
 
 	ppa.g.blk = victim_line->id;
 	NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-		    victim_line->ipc, victim_line->vpc, conv_ftl->lm[0].victim_line_cnt,
-		    conv_ftl->lm[0].full_line_cnt, conv_ftl->lm[0].free_line_cnt);
+		    victim_line->ipc, victim_line->vpc, conv_ftl->lm[stream_id].victim_line_cnt,
+		    conv_ftl->lm[stream_id].full_line_cnt, conv_ftl->lm[stream_id].free_line_cnt);
 
-	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
+	conv_ftl->wfc[stream_id].credits_to_refill = victim_line->ipc;
 
 	/* copy back valid data */
 	for (flashpg = 0; flashpg < spp->flashpgs_per_blk; flashpg++) {
-		int ch, lun;
+		int ch, lun = stream_id;
 
 		ppa.g.pg = flashpg * spp->pgs_per_flashpg;
 		for (ch = 0; ch < spp->nchs; ch++) {
-			for (lun = 0; lun < spp->luns_per_ch; lun++) {
-				struct nand_lun *lunp;
+			struct nand_lun *lunp;
 
-				ppa.g.ch = ch;
-				ppa.g.lun = lun;
-				ppa.g.pl = 0;
-				lunp = get_lun(conv_ftl->ssd, &ppa);
-				clean_one_flashpg(conv_ftl, &ppa);
+			ppa.g.ch = ch;
+			ppa.g.lun = lun;
+			ppa.g.pl = 0;
+			lunp = get_lun(conv_ftl->ssd, &ppa);
+			clean_one_flashpg(conv_ftl, &ppa);
 
-				if (flashpg == (spp->flashpgs_per_blk - 1)) {
-					struct convparams *cpp = &conv_ftl->cp;
+			if (flashpg == (spp->flashpgs_per_blk - 1)) {
+				struct convparams *cpp = &conv_ftl->cp;
 
-					mark_block_free(conv_ftl, &ppa);
+				mark_block_free(conv_ftl, &ppa);
 
-					if (cpp->enable_gc_delay) {
-						struct nand_cmd gce = {
-							.type = GC_IO,
-							.cmd = NAND_ERASE,
-							.stime = 0,
-							.interleave_pci_dma = false,
-							.ppa = &ppa,
-						};
-						ssd_advance_nand(conv_ftl->ssd, &gce);
-					}
-
-					lunp->gc_endtime = lunp->next_lun_avail_time;
+				if (cpp->enable_gc_delay) {
+					struct nand_cmd gce = {
+						.type = GC_IO,
+						.cmd = NAND_ERASE,
+						.stime = 0,
+						.interleave_pci_dma = false,
+						.ppa = &ppa,
+					};
+					ssd_advance_nand(conv_ftl->ssd, &gce);
 				}
+
+				lunp->gc_endtime = lunp->next_lun_avail_time;
 			}
 		}
 	}
@@ -916,12 +935,12 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 	return 0;
 }
 
-static void foreground_gc(struct conv_ftl *conv_ftl)
+static void foreground_gc(struct conv_ftl *conv_ftl, uint32_t stream_id)
 {
-	if (should_gc_high(conv_ftl)) {
+	if (should_gc_high(conv_ftl, stream_id)) {
 		NVMEV_DEBUG_VERBOSE("should_gc_high passed");
 		/* perform GC here until !should_gc(conv_ftl) */
-		do_gc(conv_ftl, true);
+		do_gc(conv_ftl, true, stream_id);
 	}
 }
 
@@ -1079,6 +1098,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		uint64_t nsecs_completed = 0;
 		struct ppa ppa;
 
+		NVMEV_DEBUG("%s: lpn: %lld", __func__, lpn);
+
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
 		ppa = get_maptbl_ent(
@@ -1114,8 +1135,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 						    spp->pgs_per_oneshotpg * spp->pgsz);
 		}
 
-		consume_write_credit(conv_ftl);
-		check_and_refill_write_credit(conv_ftl);
+		consume_write_credit(conv_ftl, stream_id);
+		check_and_refill_write_credit(conv_ftl, stream_id);
 	}
 
 	if ((cmd->rw.control & NVME_RW_FUA) || (spp->write_early_completion == 0)) {
