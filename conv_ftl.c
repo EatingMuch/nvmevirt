@@ -6,6 +6,11 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+static uint32_t get_stream_id(struct ppa *ppa)
+{
+	return ppa->g.lun;
+}
+
 static uint32_t get_nr_streams(struct conv_ftl *conv_ftl)
 {
 	return conv_ftl->ssd->sp.luns_per_ch;
@@ -19,12 +24,26 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
-	return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
+	uint32_t total_free_line_cnt = 0;
+	int i;
+	for (i = 0; i < get_nr_streams(conv_ftl); i++) {
+		total_free_line_cnt += conv_ftl->lm[i].free_line_cnt;
+	}
+
+	return (total_free_line_cnt <= conv_ftl->cp.gc_thres_lines);
 }
 
 static inline bool should_gc_high(struct conv_ftl *conv_ftl)
 {
-	return conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines_high;
+	int i;
+
+	for (i = 0; i < get_nr_streams(conv_ftl); i++) {
+		if (conv_ftl->lm[i].free_line_cnt <=
+		    conv_ftl->cp.gc_thres_lines_high)
+			return true;
+	}
+
+	return false;
 }
 
 static inline struct ppa get_maptbl_ent(struct conv_ftl *conv_ftl, uint64_t lpn)
@@ -111,48 +130,82 @@ static inline void check_and_refill_write_credit(struct conv_ftl *conv_ftl)
 	}
 }
 
+static void init_write_pointers(struct conv_ftl *conv_ftl)
+{
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+
+	conv_ftl->wp = kmalloc(sizeof(struct write_pointer) * nr_streams,
+			       GFP_KERNEL);
+	if (!conv_ftl->wp) {
+		NVMEV_ERROR("%s: Failed to allocate memory for write_pointer\n",
+			    __func__);
+		return;
+	}
+}
+
+static void remove_write_pointers(struct conv_ftl *conv_ftl)
+{
+	kfree(conv_ftl->wp);
+}
+
 static void init_lines(struct conv_ftl *conv_ftl)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct line *line;
-	int i;
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+	int i, j;
 
-	lm->tt_lines = spp->blks_per_pl;
-	NVMEV_ASSERT(lm->tt_lines == spp->tt_lines);
-	lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
-
-	INIT_LIST_HEAD(&lm->free_line_list);
-	INIT_LIST_HEAD(&lm->full_line_list);
-
-	lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
-					 victim_line_set_pri, victim_line_get_pos,
-					 victim_line_set_pos);
-
-	lm->free_line_cnt = 0;
-	for (i = 0; i < lm->tt_lines; i++) {
-		lm->lines[i] = (struct line){
-			.id = i,
-			.ipc = 0,
-			.vpc = 0,
-			.pos = 0,
-			.entry = LIST_HEAD_INIT(lm->lines[i].entry),
-		};
-
-		/* initialize all the lines as free lines */
-		list_add_tail(&lm->lines[i].entry, &lm->free_line_list);
-		lm->free_line_cnt++;
+	// Allocate array of line_mgmt
+	conv_ftl->lm = kmalloc(sizeof(struct line_mgmt) * nr_streams, GFP_KERNEL);
+	if (!conv_ftl->lm) {
+		NVMEV_ERROR("%s: Failed to allocate memory for line_mgmt\n", __func__);
+		return;
 	}
 
-	NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines);
-	lm->victim_line_cnt = 0;
-	lm->full_line_cnt = 0;
+	for (i = 0; i < nr_streams; i++) {
+		struct line_mgmt *lm = &conv_ftl->lm[i];
+		struct line *line;		/* Do we need this? */
+		lm->tt_lines = spp->blks_per_pl;
+		NVMEV_ASSERT(lm->tt_lines == spp->tt_lines);
+		lm->lines = vmalloc(sizeof(struct line) * lm->tt_lines);
+
+		INIT_LIST_HEAD(&lm->free_line_list);
+		INIT_LIST_HEAD(&lm->full_line_list);
+
+		lm->victim_line_pq = pqueue_init(spp->tt_lines, victim_line_cmp_pri, victim_line_get_pri,
+				victim_line_set_pri, victim_line_get_pos,
+				victim_line_set_pos);
+
+		lm->free_line_cnt = 0;
+		for (j = 0; j < lm->tt_lines; j++) {
+			lm->lines[j] = (struct line){
+				.id = j,
+					.ipc = 0,
+					.vpc = 0,
+					.pos = 0,
+					.entry = LIST_HEAD_INIT(lm->lines[j].entry),
+			};
+
+			/* initialize all the lines as free lines */
+			list_add_tail(&lm->lines[j].entry, &lm->free_line_list);
+			lm->free_line_cnt++;
+		}
+
+		NVMEV_ASSERT(lm->free_line_cnt == lm->tt_lines);
+		lm->victim_line_cnt = 0;
+		lm->full_line_cnt = 0;
+	}
 }
 
 static void remove_lines(struct conv_ftl *conv_ftl)
 {
-	pqueue_free(conv_ftl->lm.victim_line_pq);
-	vfree(conv_ftl->lm.lines);
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+	int i;
+
+	for (i = 0; i < nr_streams; i++) {
+		pqueue_free(conv_ftl->lm[i].victim_line_pq);
+		vfree(conv_ftl->lm[i].lines);
+	}
+	kfree(conv_ftl->lm);
 }
 
 static void init_write_flow_control(struct conv_ftl *conv_ftl)
@@ -169,9 +222,10 @@ static inline void check_addr(int a, int max)
 	NVMEV_ASSERT(a >= 0 && a < max);
 }
 
-static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
+static struct line *get_next_free_line(struct conv_ftl *conv_ftl,
+				       uint32_t stream_id)
 {
-	struct line_mgmt *lm = &conv_ftl->lm;
+	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
 	struct line *curline = list_first_entry_or_null(&lm->free_line_list, struct line, entry);
 
 	if (!curline) {
@@ -185,11 +239,13 @@ static struct line *get_next_free_line(struct conv_ftl *conv_ftl)
 	return curline;
 }
 
-static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
+static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type,
+				      uint32_t stream_id)
 {
 	if (io_type == USER_IO) {
-		return &ftl->wp;
+		return &ftl->wp[stream_id];
 	} else if (io_type == GC_IO) {
+		/* TODO: gc may need to be stream-aware */
 		return &ftl->gc_wp;
 	}
 
@@ -197,10 +253,11 @@ static struct write_pointer *__get_wp(struct conv_ftl *ftl, uint32_t io_type)
 	return NULL;
 }
 
-static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
+static void __prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type,
+				    uint32_t stream_id)
 {
-	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
-	struct line *curline = get_next_free_line(conv_ftl);
+	struct write_pointer *wp = __get_wp(conv_ftl, io_type, stream_id);
+	struct line *curline = get_next_free_line(conv_ftl, stream_id);
 
 	NVMEV_ASSERT(wp);
 	NVMEV_ASSERT(curline);
@@ -209,18 +266,28 @@ static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	*wp = (struct write_pointer){
 		.curline = curline,
 		.ch = 0,
-		.lun = 0,
+		.lun = stream_id,
 		.pg = 0,
 		.blk = curline->id,
 		.pl = 0,
 	};
 }
 
-static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
+static void prepare_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
+{
+	uint32_t nr_streams = conv_ftl->ssd->sp.luns_per_ch;
+	int i;
+	for (i = 0; i < nr_streams; i++) {
+		__prepare_write_pointer(conv_ftl, io_type, i);
+	}
+}
+
+static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type,
+				  uint32_t stream_id)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
-	struct write_pointer *wpp = __get_wp(conv_ftl, io_type);
+	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
+	struct write_pointer *wpp = __get_wp(conv_ftl, io_type, stream_id);
 
 	NVMEV_DEBUG_VERBOSE("current wpp: ch:%d, lun:%d, pl:%d, blk:%d, pg:%d\n",
 			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg);
@@ -237,6 +304,8 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 		goto out;
 
 	wpp->ch = 0;
+	NVMEV_ASSERT(wpp->lun == stream_id);
+#if 0
 	check_addr(wpp->lun, spp->luns_per_ch);
 	wpp->lun++;
 	/* in this case, we should go to next lun */
@@ -244,6 +313,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 		goto out;
 
 	wpp->lun = 0;
+#endif
 	/* go to next wordline in the block */
 	wpp->pg += spp->pgs_per_oneshotpg;
 	if (wpp->pg != spp->pgs_per_blk)
@@ -267,7 +337,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 	}
 	/* current line is used up, pick another empty line */
 	check_addr(wpp->blk, spp->blks_per_pl);
-	wpp->curline = get_next_free_line(conv_ftl);
+	wpp->curline = get_next_free_line(conv_ftl, stream_id);
 	NVMEV_DEBUG_VERBOSE("wpp: got new clean line %d\n", wpp->curline->id);
 
 	wpp->blk = wpp->curline->id;
@@ -275,7 +345,7 @@ static void advance_write_pointer(struct conv_ftl *conv_ftl, uint32_t io_type)
 
 	/* make sure we are starting from page 0 in the super block */
 	NVMEV_ASSERT(wpp->pg == 0);
-	NVMEV_ASSERT(wpp->lun == 0);
+	NVMEV_ASSERT(wpp->lun == stream_id);
 	NVMEV_ASSERT(wpp->ch == 0);
 	/* TODO: assume # of pl_per_lun is 1, fix later */
 	NVMEV_ASSERT(wpp->pl == 0);
@@ -284,10 +354,11 @@ out:
 			wpp->ch, wpp->lun, wpp->pl, wpp->blk, wpp->pg, wpp->curline->id);
 }
 
-static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type)
+static struct ppa get_new_page(struct conv_ftl *conv_ftl, uint32_t io_type,
+			       uint32_t stream_id)
 {
 	struct ppa ppa;
-	struct write_pointer *wp = __get_wp(conv_ftl, io_type);
+	struct write_pointer *wp = __get_wp(conv_ftl, io_type, stream_id);
 
 	ppa.ppa = 0;
 	ppa.g.ch = wp->ch;
@@ -349,6 +420,12 @@ static void conv_init_ftl(struct conv_ftl *conv_ftl, struct convparams *cpp, str
 	/* initialize all the lines */
 	init_lines(conv_ftl);
 
+	/*
+	 * initialize write pointers
+	 * TODO: gc_wp needs initialization for adopting multi-stream
+	 */
+	init_write_pointers(conv_ftl);
+
 	/* initialize write pointer, this is how we allocate new pages for writes */
 	prepare_write_pointer(conv_ftl, USER_IO);
 	prepare_write_pointer(conv_ftl, GC_IO);
@@ -366,6 +443,7 @@ static void conv_remove_ftl(struct conv_ftl *conv_ftl)
 	remove_lines(conv_ftl);
 	remove_rmap(conv_ftl);
 	remove_maptbl(conv_ftl);
+	remove_write_pointers(conv_ftl);
 }
 
 static void conv_init_params(struct convparams *cpp)
@@ -485,18 +563,20 @@ static inline bool mapped_ppa(struct ppa *ppa)
 
 static inline struct line *get_line(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	return &(conv_ftl->lm.lines[ppa->g.blk]);
+	return &(conv_ftl->lm[get_stream_id(ppa)].lines[ppa->g.blk]);
 }
 
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
+	uint32_t stream_id = get_stream_id(ppa);
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
+	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
 	struct nand_block *blk = NULL;
 	struct nand_page *pg = NULL;
 	bool was_full_line = false;
 	struct line *line;
+
 
 	/* update corresponding page status */
 	pg = get_pg(conv_ftl->ssd, ppa);
@@ -607,7 +687,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	uint64_t lpn = get_rmap_ent(conv_ftl, old_ppa);
 
 	NVMEV_ASSERT(valid_lpn(conv_ftl, lpn));
-	new_ppa = get_new_page(conv_ftl, GC_IO);
+	new_ppa = get_new_page(conv_ftl, GC_IO, 0);
 	/* update maptbl */
 	set_maptbl_ent(conv_ftl, lpn, &new_ppa);
 	/* update rmap */
@@ -616,7 +696,7 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	mark_page_valid(conv_ftl, &new_ppa);
 
 	/* need to advance the write pointer here */
-	advance_write_pointer(conv_ftl, GC_IO);
+	advance_write_pointer(conv_ftl, GC_IO, 0);
 
 	if (cpp->enable_gc_delay) {
 		struct nand_cmd gcw = {
@@ -646,10 +726,28 @@ static uint64_t gc_write_page(struct conv_ftl *conv_ftl, struct ppa *old_ppa)
 	return 0;
 }
 
+/* return lm with most number of free lines */
+static uint32_t find_lm(struct conv_ftl *conv_ftl)
+{
+	int max_index = 0;
+	int max_free_lines = conv_ftl->lm[0].free_line_cnt;
+	uint32_t nr_streams = get_nr_streams(conv_ftl);
+
+	for (int i = 1; i < nr_streams; i++) {
+		if (conv_ftl->lm[i].free_line_cnt > max_free_lines) {
+			max_free_lines = conv_ftl->lm[i].free_line_cnt;
+			max_index = i;
+		}
+	}
+
+	return max_index;
+}
+
 static struct line *select_victim_line(struct conv_ftl *conv_ftl, bool force)
 {
+	uint32_t stream_id = find_lm(conv_ftl);
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
-	struct line_mgmt *lm = &conv_ftl->lm;
+	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
 	struct line *victim_line = NULL;
 
 	victim_line = pqueue_peek(lm->victim_line_pq);
@@ -745,7 +843,8 @@ static void clean_one_flashpg(struct conv_ftl *conv_ftl, struct ppa *ppa)
 
 static void mark_line_free(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
-	struct line_mgmt *lm = &conv_ftl->lm;
+	uint32_t stream_id = get_stream_id(ppa);
+	struct line_mgmt *lm = &conv_ftl->lm[stream_id];
 	struct line *line = get_line(conv_ftl, ppa);
 	line->ipc = 0;
 	line->vpc = 0;
@@ -768,8 +867,8 @@ static int do_gc(struct conv_ftl *conv_ftl, bool force)
 
 	ppa.g.blk = victim_line->id;
 	NVMEV_DEBUG_VERBOSE("GC-ing line:%d,ipc=%d(%d),victim=%d,full=%d,free=%d\n", ppa.g.blk,
-		    victim_line->ipc, victim_line->vpc, conv_ftl->lm.victim_line_cnt,
-		    conv_ftl->lm.full_line_cnt, conv_ftl->lm.free_line_cnt);
+		    victim_line->ipc, victim_line->vpc, conv_ftl->lm[0].victim_line_cnt,
+		    conv_ftl->lm[0].full_line_cnt, conv_ftl->lm[0].free_line_cnt);
 
 	conv_ftl->wfc.credits_to_refill = victim_line->ipc;
 
@@ -991,7 +1090,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		}
 
 		/* new write */
-		ppa = get_new_page(conv_ftl, USER_IO);
+		ppa = get_new_page(conv_ftl, USER_IO, stream_id);
 		/* update maptbl */
 		set_maptbl_ent(conv_ftl, local_lpn, &ppa);
 		NVMEV_DEBUG("%s: got new ppa %lld, ", __func__, ppa2pgidx(conv_ftl, &ppa));
@@ -1001,7 +1100,7 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		mark_page_valid(conv_ftl, &ppa);
 
 		/* need to advance the write pointer here */
-		advance_write_pointer(conv_ftl, USER_IO);
+		advance_write_pointer(conv_ftl, USER_IO, stream_id);
 
 		/* Aggregate write io in flash page */
 		if (last_pg_in_wordline(conv_ftl, &ppa)) {
