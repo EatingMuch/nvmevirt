@@ -76,6 +76,8 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 	spp->luns_per_ch = LUNS_PER_NAND_CH;
 	spp->cell_mode = CELL_MODE;
 
+	spp->nstreams = NR_STREAMS;
+
 	/* partitioning SSD by dividing channel*/
 	NVMEV_ASSERT((spp->nchs % nparts) == 0);
 	spp->nchs /= nparts;
@@ -162,11 +164,12 @@ void ssd_init_params(struct ssdparams *spp, uint64_t capacity, uint32_t nparts)
 		     spp->secsz * spp->secs_per_pg;
 	blk_size = spp->pgs_per_blk * spp->secsz * spp->secs_per_pg;
 	NVMEV_INFO(
-		"Total Capacity(GiB,MiB)=%llu,%llu chs=%u luns=%lu lines=%lu blk-size(MiB,KiB)=%u,%u line-size(MiB,KiB)=%lu,%lu",
+		"Total Capacity(GiB,MiB)=%llu,%llu chs=%u luns=%lu lines=%lu blk-size(MiB,KiB)=%u,%u line-size(MiB,KiB)=%lu,%lu, nr_streams=%d",
 		BYTE_TO_GB(total_size), BYTE_TO_MB(total_size), spp->nchs, spp->tt_luns,
 		spp->tt_lines, BYTE_TO_MB(spp->pgs_per_blk * spp->pgsz),
 		BYTE_TO_KB(spp->pgs_per_blk * spp->pgsz), BYTE_TO_MB(spp->pgs_per_line * spp->pgsz),
-		BYTE_TO_KB(spp->pgs_per_line * spp->pgsz));
+		BYTE_TO_KB(spp->pgs_per_line * spp->pgsz),
+		spp->nstreams);
 }
 
 static void ssd_init_nand_page(struct nand_page *pg, struct ssdparams *spp)

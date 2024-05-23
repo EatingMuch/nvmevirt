@@ -578,6 +578,8 @@ static void __print_base_config(void)
 	case WD_ZN540:
 		type = "WD ZN540 ZNS SSD";
 		break;
+	case MULTI_STREAM_SSD:
+		type = "MULTI STREAM SSD";
 	}
 
 	NVMEV_INFO("Version %x.%x for >> %s <<\n",

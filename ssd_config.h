@@ -9,6 +9,7 @@
 #define ZNS_PROTOTYPE 2
 #define KV_PROTOTYPE 3
 #define WD_ZN540 4
+#define MULTI_STREAM_SSD 5
 
 /* SSD Type */
 #define SSD_TYPE_NVM 0
@@ -60,7 +61,7 @@ enum {
 #define LBA_BITS (9)
 #define LBA_SIZE (1 << LBA_BITS)
 
-#elif (BASE_SSD == SAMSUNG_970PRO)
+#elif (BASE_SSD == SAMSUNG_970PRO || BASE_SSD == MULTI_STREAM_SSD)
 #define NR_NAMESPACES 1
 
 #define NS_SSD_TYPE_0 SSD_TYPE_CONV
@@ -70,6 +71,11 @@ enum {
 #define MDTS (6)
 #define CELL_MODE (CELL_MODE_MLC)
 
+#if (BASE_SSD == MULTI_STREAM_SSD)
+#define NR_STREAMS (2)
+#else
+#define NR_STREAMS (1)
+#endif
 #define SSD_PARTITIONS (4)
 #define NAND_CHANNELS (8)
 #define LUNS_PER_NAND_CH (2)
