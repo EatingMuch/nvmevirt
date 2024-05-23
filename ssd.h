@@ -158,6 +158,7 @@ struct ssdparams {
 	int pls_per_lun; /* # of planes per LUN (Die) */
 	int luns_per_ch; /* # of LUNs per channel */
 	int nchs; /* # of channels in the SSD */
+	int nstreams; /* # of streams in the SSD */
 	int cell_mode;
 
 	/* Unit size of NVMe write command
