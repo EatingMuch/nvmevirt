@@ -357,6 +357,8 @@ uint64_t ssd_advance_write_buffer(struct ssd *ssd, uint64_t request_time, uint64
 	return nsecs_latest;
 }
 
+extern uint64_t nand_write_count;
+
 uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 {
 	int c = ncmd->cmd;
@@ -426,6 +428,7 @@ uint64_t ssd_advance_nand(struct ssd *ssd, struct nand_cmd *ncmd)
 		nand_etime = nand_stime + spp->pg_wr_lat;
 		lun->next_lun_avail_time = nand_etime;
 		completed_time = nand_etime;
+		nand_write_count +=  ncmd->xfer_size / spp->pgsz;
 		break;
 
 	case NAND_ERASE:
