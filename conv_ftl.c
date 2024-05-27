@@ -8,6 +8,47 @@
 #include "nvmev.h"
 #include "conv_ftl.h"
 
+uint64_t write_count;
+uint64_t nand_write_count;
+
+static int nand_write_count_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%llu\n", nand_write_count);
+
+	return 0;
+}
+
+static int nand_write_count_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, nand_write_count_show, (void *)file->f_path.dentry->d_name.name);
+}
+
+static const struct proc_ops nand_write_count_fops = {
+	.proc_open    = nand_write_count_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+static int write_count_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%llu\n", write_count);
+
+	return 0;
+}
+
+static int write_count_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, write_count_show, (void *)file->f_path.dentry->d_name.name);
+}
+
+static const struct proc_ops write_count_fops = {
+	.proc_open    = write_count_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
 static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *ppa)
 {
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -392,6 +433,8 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
 
 	ftls_dir = proc_mkdir("ftls", nvmev_vdev->proc_root);
+	proc_create("write_count", 0444, ftls_dir, &write_count_fops);
+	proc_create("nand_write_count", 0444, ftls_dir, &nand_write_count_fops);
 
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
@@ -440,7 +483,8 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 		snprintf(dir_name, sizeof(dir_name), "nvmev/ftls/ftl%u", i);
 		remove_proc_entry(dir_name, NULL);
 	}
-	// Remove the nvmev/ftls directory
+	remove_proc_entry("nvmev/ftls/write_count", NULL);
+	remove_proc_entry("nvmev/ftls/nand_write_count", NULL);
 	remove_proc_entry("nvmev/ftls", NULL);
 
 	/* PCIe, Write buffer are shared by all instances*/
@@ -990,6 +1034,8 @@ static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 		uint64_t local_lpn;
 		uint64_t nsecs_completed = 0;
 		struct ppa ppa;
+
+		write_count++;
 
 		conv_ftl = &conv_ftls[lpn % nr_parts];
 		local_lpn = lpn / nr_parts;
