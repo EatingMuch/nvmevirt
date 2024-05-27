@@ -2,6 +2,8 @@
 
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include "nvmev.h"
 #include "conv_ftl.h"
@@ -381,16 +383,24 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	struct ssd *ssd;
 	uint32_t i;
 	const uint32_t nr_parts = SSD_PARTITIONS;
+	char dir_name[32];
+	struct proc_dir_entry *ftl_dir, *ftls_dir;
 
 	ssd_init_params(&spp, size, nr_parts);
 	conv_init_params(&cpp);
 
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
 
+	ftls_dir = proc_mkdir("ftls", nvmev_vdev->proc_root);
+
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
 		ssd_init(ssd, &spp, cpu_nr_dispatcher);
 		conv_init_ftl(&conv_ftls[i], &cpp, ssd);
+
+		// Create proc entries for each ftl
+		snprintf(dir_name, sizeof(dir_name), "ftl%u", i);
+		ftl_dir = proc_mkdir(dir_name, ftls_dir);
 	}
 
 	/* PCIe, Write buffer are shared by all instances*/
@@ -423,6 +433,15 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
 	const uint32_t nr_parts = SSD_PARTITIONS;
 	uint32_t i;
+	char dir_name[32];
+
+	// Remove proc entries
+	for (i = 0; i < nr_parts; i++) {
+		snprintf(dir_name, sizeof(dir_name), "nvmev/ftls/ftl%u", i);
+		remove_proc_entry(dir_name, NULL);
+	}
+	// Remove the nvmev/ftls directory
+	remove_proc_entry("nvmev/ftls", NULL);
 
 	/* PCIe, Write buffer are shared by all instances*/
 	for (i = 1; i < nr_parts; i++) {
