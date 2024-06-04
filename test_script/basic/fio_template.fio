@@ -1,0 +1,27 @@
+[global]
+ioengine=../../spdk/build/fio/spdk_nvme
+thread=1
+group_reporting=1
+direct=1
+verify=0
+time_based=1
+runtime=60
+log_avg_msec=1000
+write_bw_log=write
+numjobs=1
+
+[job0]
+rw={job0_rw}
+bs={job0_bs}
+offset=0
+size=50%
+iodepth={job0_iodepth}
+filename=trtype=PCIe traddr=0001\:10\:00.0 directive_id=1 ns=1
+
+[job1]
+rw={job1_rw}
+bs={job1_bs}
+offset=50%
+size=50%
+iodepth={job1_iodepth}
+filename=trtype=PCIe traddr=0001\:10\:00.0 directive_id=2 ns=1

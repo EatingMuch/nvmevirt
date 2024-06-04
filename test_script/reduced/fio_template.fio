@@ -1,0 +1,12 @@
+[global]
+ioengine=../../spdk/build/fio/spdk_nvme
+thread=1
+group_reporting=1
+direct=1
+verify=0
+time_based=1
+ramp_time=0
+runtime=30
+log_avg_msec=1000
+write_bw_log=write
+
