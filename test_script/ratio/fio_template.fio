@@ -1,0 +1,29 @@
+[global]
+ioengine=../../spdk/build/fio/spdk_nvme
+thread=1
+group_reporting=1
+direct=1
+verify=0
+time_based=1
+ramp_time=240
+runtime=60
+numjobs=1
+
+# Main phase: two jobs, each with different offset and size
+[job0]
+rw=write
+bs=128k
+offset={job0_offset}
+size={job0_size}
+iodepth=4
+filename=trtype=PCIe traddr=0001\:10\:00.0 directive_id=1 ns=1
+rate={job0_rate}
+
+[job1]
+rw=randwrite
+bs=4k
+offset={job1_offset}
+size={job1_size}
+iodepth=16
+filename=trtype=PCIe traddr=0001\:10\:00.0 directive_id=2 ns=1
+rate={job1_rate}
