@@ -5,6 +5,7 @@ import sys
 import os
 import argparse
 from collections import defaultdict
+import matplotlib.pyplot as plt
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -92,11 +93,32 @@ def run_fio(config, output_file):
     # Run rmmod.sh after finishing the test
     util.run_command("../rmmod.sh", "rmmod.sh")
 
+def plot_results(result_dir, plot_filename):
+    for i, config in enumerate(configs):
+        output_file = os.path.join(result_dir,
+            f"{config['job0_rw']}_{config['job0_bs']}_{config['job0_iodepth']}_"
+            f"{config['job1_rw']}_{config['job1_bs']}_{config['job1_iodepth']}.log")
+        timestamps = []
+        bandwidths = []
+        with open(output_file, 'r') as f:
+            for line in f:
+                parts = line.split()
+                timestamps.append(float(parts[0]))
+                bandwidths.append(int(parts[1]) / 1024)  # Convert KB/s to MB/s
+        plt.plot(timestamps, bandwidths, label=f"Test {i+1}")
+
+    plt.xlabel('Time (s)')
+    plt.ylabel('Combined Bandwidth (MB/s)')
+    plt.legend()
+    plt.savefig(plot_filename)
+    print(f"Plot saved as {plot_filename}")
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run fio benchmarks and process output.")
     parser.add_argument("--result", default="result",
                         help="Directory to save result files.")
+    parser.add_argument("--plot", help="Filename to save the plot.")
     args = parser.parse_args()
 
     if os.path.exists(args.result):
@@ -113,6 +135,10 @@ def main():
         print(f"Starting test case {i+1}")
         run_fio(config, output_file)
         print(f"Completed test case {i+1}")
+
+    if args.plot:
+        plot_filename = os.path.join(args.result, args.plot)
+        plot_results(args.result, plot_filename)
 
 if __name__ == "__main__":
     main()
