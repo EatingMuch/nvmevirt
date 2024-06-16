@@ -69,7 +69,6 @@ def run_fio(config, output_file):
             rf.write(f"{every_second} {nand_write_count} {write_count}\n")
         time.sleep(1)
     fio_process.wait()
-    util.run_command("fio current_fio_script.fio", "fio")
  
     # Parse bandwidth logs
     job0_data = parse_bw_log('write_bw.1.log')
